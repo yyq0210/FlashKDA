@@ -133,10 +133,13 @@ def fwd_cp(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
         return fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
                    initial_state, final_state, cu_seqlens)
 
-    # --- Pass 1: Run all sub-segments with h0=0, capture final_state ---
-    ht_buffer = torch.empty(cp_N, H, D, D, dtype=torch.float32, device=q.device)
-    fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
-        initial_state=None, final_state=ht_buffer, cu_seqlens=cp_cu_seqlens)
+    # --- Pass 1: State-only kernel (processes all chunks per segment) ---
+    from flash_kda import state_only
+    warmup_vals = [(cp_seqlens_list[i+1] - cp_seqlens_list[i] + CHUNK_SIZE - 1) // CHUNK_SIZE
+                   for i in range(cp_N)]
+    num_warmup = torch.tensor(warmup_vals, dtype=torch.int32, device=q.device)
+    ht_buffer = state_only(k, v, g, beta, A_log, dt_bias, lower_bound,
+                           cp_cu_seqlens, num_warmup)
 
     # --- Build corrected initial states ---
     cp_h0 = torch.zeros(cp_N, H, D, D, dtype=torch.float32, device=q.device)

@@ -1,5 +1,5 @@
 import torch
-from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+from flash_kda_C import fwd as _fwd_raw, get_workspace_size, state_only as _state_only_raw
 
 
 def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
@@ -39,6 +39,30 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
 
     _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
              initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+
+
+def state_only(k, v, g, beta, A_log, dt_bias, lower_bound, cu_seqlens, num_warmup_chunks):
+    """FlashKDA state-only kernel: computes final recurrent state without output.
+
+    Runs only the state recurrence on the last `num_warmup_chunks` chunks of
+    each segment. Used by CP to efficiently obtain ht without a full forward pass.
+
+    Args:
+        k, v, g, beta: Same as fwd().
+        A_log, dt_bias, lower_bound: Same as fwd().
+        cu_seqlens (torch.Tensor): Cumulative sequence lengths, int64, [N+1].
+        num_warmup_chunks (torch.Tensor): Number of trailing chunks to process
+            per segment, int32, shape [N].
+
+    Returns:
+        ht (torch.Tensor): Final state per segment, fp32, shape [N, H, D, D].
+    """
+    H = k.shape[2]
+    D = k.shape[3]
+    N = cu_seqlens.numel() - 1
+    ht = torch.empty(N, H, D, D, dtype=torch.float32, device=k.device)
+    _state_only_raw(k, v, g, beta, A_log, dt_bias, lower_bound, ht, cu_seqlens, num_warmup_chunks)
+    return ht
 
 
 def fwd_cp(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
