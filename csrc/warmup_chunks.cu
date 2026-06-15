@@ -8,6 +8,7 @@
 // Grid: (N,)  Block: (H,) where H <= 256
 // Each block processes one segment, each thread handles one head.
 // Scans backwards from the end accumulating gate decay until all heads converge.
+// Uses min over D dimensions (not mean) to guarantee the weakest dimension converges.
 __global__ void get_warmup_chunks_kernel(
     const __nv_bfloat16* __restrict__ g_ptr,  // [T, H, D]
     const float* __restrict__ A_log,          // [H]
@@ -30,13 +31,7 @@ __global__ void get_warmup_chunks_kernel(
     int seg_len = (int)(eos - bos);
     int nc = (seg_len + chunk_size - 1) / chunk_size;
 
-    // Precompute exp(A_log[h]) and mean(dt_bias[h, :])
     float a_exp = expf(A_log[h]);
-    float dt_mean = 0.0f;
-    for (int d = 0; d < D; d++) {
-        dt_mean += dt_bias[h * D + d];
-    }
-    dt_mean /= (float)D;
 
     // Per-head cumulative decay (negative, grows more negative)
     float g_cumsum = 0.0f;
@@ -51,19 +46,18 @@ __global__ void get_warmup_chunks_kernel(
         int chunk_end = (int)(eos - c * chunk_size - 1);
         if (chunk_end < (int)bos) chunk_end = (int)bos;
 
-        // Compute mean(g[chunk_end, h, :]) over D dimension
-        float g_mean = 0.0f;
+        // Compute min over D: gate per-dim, take the weakest (least negative)
         const __nv_bfloat16* g_row = g_ptr + (int64_t)chunk_end * H * D + (int64_t)h * D;
+        float sig_min = 1.0f;  // sigmoid max is 1, start high
         for (int d = 0; d < D; d++) {
-            g_mean += __bfloat162float(g_row[d]);
+            float g_val = __bfloat162float(g_row[d]);
+            float x = a_exp * (g_val + dt_bias[h * D + d]);
+            float sig = 1.0f / (1.0f + expf(-x));
+            sig_min = fminf(sig_min, sig);
         }
-        g_mean /= (float)D;
 
-        // gate_activation = gate_scale * sigmoid(exp(A_log[h]) * (g_mean + dt_mean))
-        float x = a_exp * (g_mean + dt_mean);
-        float sig = 1.0f / (1.0f + expf(-x));
-        float decay = gate_scale * sig * (float)chunk_size;
-
+        // gate_scale is negative, sig_min is the weakest sigmoid → least decay
+        float decay = gate_scale * sig_min * (float)chunk_size;
         g_cumsum += decay;
 
         // Reduction: find max g_cumsum across heads (max = least negative = slowest head)

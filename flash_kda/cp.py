@@ -211,9 +211,11 @@ def _calc_cp_seqs(cu_seqlens, num_heads, chunk_size=CHUNK_SIZE):
 
     Be = total_chunks / max(num_chunks) if max(num_chunks) > 0 else raw_batch_size
     # FlashKDA uses a 2-pass strategy, so CP only helps when SM utilization
-    # is very low. The non-CP grid is (N, H) = Be*H blocks.
-    # With 2 passes, break-even requires Be*H < SM_COUNT/4 approximately.
-    use_cp = Be * H <= sm_count // 4
+    # is low. The non-CP grid is (N, H) = Be*H blocks per pass.
+    # With 2 passes, each pass is roughly half the work; break-even requires
+    # Be*H < SM_COUNT/2 approximately.  At H=32 on a 78-SM GPU, utilization
+    # is only 41%, so CP still provides meaningful parallelism for long seqs.
+    use_cp = Be * H <= sm_count // 2
 
     if not use_cp:
         return False, None, None, None
@@ -276,17 +278,11 @@ def fwd_cp(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
     cp_N = cp_cu_seqlens.numel() - 1
 
     # --- Step 1: Determine warmup chunks per segment ---
-    # Fast path: if 1 chunk of decay is guaranteed to exceed threshold, skip scanning.
-    # Conservative estimate: per-chunk decay >= lower_bound * 1.4427 * 0.25 * CHUNK_SIZE
-    # (sigmoid min is ~0.25 for typical A_log range; using 0.25 is conservative)
-    per_chunk_decay_bound = lower_bound * 1.4426950408889634 * 0.25 * CHUNK_SIZE
-    if per_chunk_decay_bound < -10.0:
-        num_warmup = torch.ones(cp_N, dtype=torch.int32, device=q.device)
-        fallback_mask = torch.zeros(cp_N, dtype=torch.bool, device=q.device)
-    else:
-        num_warmup, fallback_mask = get_warmup_chunks_cuda(
-            g, A_log, dt_bias, lower_bound, cp_cu_seqlens, CHUNK_SIZE
-        )
+    # CUDA kernel scans backwards from each segment end.
+    # First iteration uses min_d for early exit (data-dependent, per-head).
+    num_warmup, fallback_mask = get_warmup_chunks_cuda(
+        g, A_log, dt_bias, lower_bound, cp_cu_seqlens, CHUNK_SIZE
+    )
 
     # Determine if any segment needs mt computation
     need_mt = fallback_mask.any().item()
