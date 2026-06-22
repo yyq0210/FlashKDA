@@ -66,14 +66,27 @@ struct WorkspaceSizes {
     static_assert(CHUNK * D * 2 % 128 == 0);
     static_assert(D * 4 % 128 == 0);
     static_assert(CHUNK * CHUNK * 2 % 128 == 0);
+    static_assert(CHUNK * D * 4 % 128 == 0);
 
+    // bf16 workspace (used by forward K2 via TMA)
     static constexpr int kKDecayed  = CHUNK * D * 2;        // 4096
     static constexpr int kQDecayed  = CHUNK * D * 2;        // 4096
     static constexpr int kKRestored = CHUNK * D * 2;        // 4096
+    static constexpr int kKInv      = CHUNK * D * 2;        // 4096 (k_inv for backward, bf16)
     static constexpr int kGTotal    = D * 4;                 // 512
     static constexpr int kINV       = CHUNK * CHUNK * 2;     // 512
     static constexpr int kMqk       = CHUNK * CHUNK * 2;     // 512
-    static constexpr int64_t kPerTile = kKDecayed + kQDecayed + kKRestored + kGTotal + kINV + kMqk;
+    static constexpr int kGCumsum   = CHUNK * D * 4;         // 8192 (gate cumsum in log2 space, fp32)
+
+    // fp32 workspace (used by backward kernels for precision)
+    static constexpr int kKDecayedFP32  = CHUNK * D * 4;    // 8192
+    static constexpr int kQDecayedFP32  = CHUNK * D * 4;    // 8192
+    static constexpr int kKInvFP32      = CHUNK * D * 4;    // 8192
+    static constexpr int kKRestoredFP32 = CHUNK * D * 4;    // 8192
+
+    static constexpr int64_t kPerTile = kKDecayed + kQDecayed + kKRestored + kKInv
+        + kGTotal + kINV + kMqk + kGCumsum
+        + kKDecayedFP32 + kQDecayedFP32 + kKInvFP32 + kKRestoredFP32;
 };
 
 enum class WarpRole {

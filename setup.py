@@ -32,6 +32,7 @@ ext_modules = [
         sources=[
             'csrc/flash_kda.cpp',
             'csrc/smxx/fwd_launch.cu',
+            'csrc/smxx/bwd_launch.cu',
         ],
         include_dirs=[
             os.path.join(this_dir, 'cutlass', 'include'),

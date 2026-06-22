@@ -15,6 +15,7 @@ void launch_fwd(
     void* final_state_ptr,
     cutlass::bfloat16_t* out_ptr,
     void* workspace_ptr,
+    cutlass::bfloat16_t* all_states_ptr,
     int total_tiles,
     int T_total,
     int H,

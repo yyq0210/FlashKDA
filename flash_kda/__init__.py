@@ -1,8 +1,9 @@
 import torch
-from flash_kda_C import fwd as _fwd_raw, get_workspace_size
+from flash_kda_C import fwd as _fwd_raw, bwd as _bwd_raw, get_workspace_size
 
 
-def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state=None, final_state=None, cu_seqlens=None):
+def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
+        initial_state=None, final_state=None, cu_seqlens=None, all_states=None):
     """FlashKDA forward (Flash Kimi Delta Attention).
 
     Args:
@@ -25,6 +26,9 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
             recurrent state. Same dtype/shape rules as ``initial_state``.
         cu_seqlens (torch.Tensor, optional): Cumulative sequence lengths, int64,
             shape ``[N+1]``. When provided, ``B`` must be 1.
+        all_states (torch.Tensor, optional): Buffer to save all chunk states
+            for backward pass. Shape ``[N*H*total_tiles, D, D]`` bf16.
+            If ``None``, states are not saved.
 
     Notes:
         * Currently requires ``K = V = 128``.
@@ -38,4 +42,28 @@ def fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound, initial_state
     workspace = torch.empty(get_workspace_size(T_total, H, N), dtype=torch.uint8, device=q.device)
 
     _fwd_raw(q, k, v, g, beta, float(scale), out, workspace, A_log, dt_bias, lower_bound,
-             initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens)
+             initial_state=initial_state, final_state=final_state, cu_seqlens=cu_seqlens,
+             all_states=all_states)
+
+    return workspace
+
+
+def bwd(q, k, v, g, beta, scale, workspace, all_states, do_tensor,
+        A_log, dt_bias, lower_bound,
+        dq, dk, dv, dg, dbeta, dA_log, ddt_bias,
+        dfinal_state=None, dinitial_state=None, cu_seqlens=None):
+    """FlashKDA backward (CUDA kernel).
+
+    All gradient tensors (dq, dk, dv, dg, dbeta) must be pre-allocated.
+    dA_log and ddt_bias are accumulated (atomicAdd), so they should be zeroed before calling.
+    """
+    _bwd_raw(q, k, v, g, beta, float(scale), workspace, all_states, do_tensor,
+             A_log, dt_bias, lower_bound,
+             dq, dk, dv, dg, dbeta, dA_log, ddt_bias,
+             dfinal_state=dfinal_state, dinitial_state=dinitial_state,
+             cu_seqlens=cu_seqlens)
+
+
+from .autograd import FlashKDAFunction, flash_kda_func  # noqa: E402
+
+__all__ = ["fwd", "bwd", "get_workspace_size", "FlashKDAFunction", "flash_kda_func"]

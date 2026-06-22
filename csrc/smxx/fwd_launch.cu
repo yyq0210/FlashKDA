@@ -15,6 +15,7 @@ void launch_fwd(
     void* final_state_ptr,
     cutlass::bfloat16_t* out_ptr,
     void* workspace_ptr,
+    cutlass::bfloat16_t* all_states_ptr,
     int total_tiles,
     int T_total,
     int H,
@@ -64,9 +65,18 @@ void launch_fwd(
     BF16*  ws_kd  = reinterpret_cast<BF16*>(ws);
     BF16*  ws_qd  = reinterpret_cast<BF16*>(ws + n_ht * WS::kKDecayed);
     BF16*  ws_kr  = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed));
-    float* ws_gt  = reinterpret_cast<float*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored));
-    BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal));
-    BF16*  ws_mqk = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kGTotal + WS::kINV));
+    BF16*  ws_ki  = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored));
+    float* ws_gt  = reinterpret_cast<float*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kKInv));
+    BF16*  ws_inv = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kKInv + WS::kGTotal));
+    BF16*  ws_mqk = reinterpret_cast<BF16*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kKInv + WS::kGTotal + WS::kINV));
+    float* ws_gc  = reinterpret_cast<float*>(ws + n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kKInv + WS::kGTotal + WS::kINV + WS::kMqk));
+
+    // fp32 workspace for backward precision
+    int64_t fp32_base = n_ht * (WS::kKDecayed + WS::kQDecayed + WS::kKRestored + WS::kKInv + WS::kGTotal + WS::kINV + WS::kMqk + WS::kGCumsum);
+    float* ws_kd_fp32 = reinterpret_cast<float*>(ws + fp32_base);
+    float* ws_qd_fp32 = reinterpret_cast<float*>(ws + fp32_base + n_ht * WS::kKDecayedFP32);
+    float* ws_ki_fp32 = reinterpret_cast<float*>(ws + fp32_base + n_ht * (WS::kKDecayedFP32 + WS::kQDecayedFP32));
+    float* ws_kr_fp32 = reinterpret_cast<float*>(ws + fp32_base + n_ht * (WS::kKDecayedFP32 + WS::kQDecayedFP32 + WS::kKInvFP32));
 
     auto ws_kd_gmem_layout = make_layout(make_shape(int(n_ht), CHUNK, D), LayoutRight{});
     auto ws_qd_gmem_layout = ws_kd_gmem_layout;
@@ -77,6 +87,7 @@ void launch_fwd(
     Tensor m_ws_kd  = make_tensor(make_gmem_ptr(ws_kd), ws_kd_gmem_layout);
     Tensor m_ws_qd  = make_tensor(make_gmem_ptr(ws_qd), ws_qd_gmem_layout);
     Tensor m_ws_kr  = make_tensor(make_gmem_ptr(ws_kr), ws_kr_gmem_layout);
+    Tensor m_ws_ki  = make_tensor(make_gmem_ptr(ws_ki), ws_kd_gmem_layout);
     Tensor m_ws_gt  = make_tensor(make_gmem_ptr(ws_gt), ws_gt_gmem_layout);
     Tensor m_ws_inv = make_tensor(make_gmem_ptr(ws_inv), ws_lm_gmem_layout);
     Tensor m_ws_mqk = make_tensor(make_gmem_ptr(ws_mqk), ws_lm_gmem_layout);
@@ -96,6 +107,7 @@ void launch_fwd(
     auto tma_store_ws_kd  = make_tma_copy(SM90_TMA_STORE{}, m_ws_kd, TMAVOLayout{});
     auto tma_store_ws_qd  = make_tma_copy(SM90_TMA_STORE{}, m_ws_qd, TMAVOLayout{});
     auto tma_store_ws_kr  = make_tma_copy(SM90_TMA_STORE{}, m_ws_kr, TMAVOLayout{});
+    auto tma_store_ws_ki  = make_tma_copy(SM90_TMA_STORE{}, m_ws_ki, TMAVOLayout{});
     auto tma_store_ws_gt  = make_tma_copy(SM90_TMA_STORE{}, m_ws_gt, TMAGTotalSmemLayout{});
     auto tma_store_ws_inv = make_tma_copy(SM90_TMA_STORE{}, m_ws_inv, TMALMLayout{});
     auto tma_store_ws_mqk = make_tma_copy(SM90_TMA_STORE{}, m_ws_mqk, TMALMLayout{});
@@ -152,7 +164,7 @@ void launch_fwd(
             decltype(tma_load_q), decltype(tma_load_k),
             decltype(tma_load_beta),
             decltype(tma_load_g), decltype(tma_load_dt_bias),
-            decltype(tma_store_ws_kd), decltype(tma_store_ws_qd), decltype(tma_store_ws_kr),
+            decltype(tma_store_ws_kd), decltype(tma_store_ws_qd), decltype(tma_store_ws_kr), decltype(tma_store_ws_ki),
             decltype(tma_store_ws_gt), decltype(tma_store_ws_inv), decltype(tma_store_ws_mqk),
             CHUNK, D, kK1Threads, IsVarlen
         >;
@@ -165,10 +177,11 @@ void launch_fwd(
         kernel1<<<grid_k1, block_k1, smem_size_k1, stream>>>(
             tma_load_q, tma_load_k, tma_load_beta,
             tma_load_g, tma_load_dt_bias,
-            tma_store_ws_kd, tma_store_ws_qd, tma_store_ws_kr,
+            tma_store_ws_kd, tma_store_ws_qd, tma_store_ws_kr, tma_store_ws_ki,
             tma_store_ws_gt, tma_store_ws_inv, tma_store_ws_mqk,
             scale, T_total, H, N, cu_seqlens_ptr, total_tiles,
-            A_log_ptr, gate_scale
+            A_log_ptr, gate_scale, ws_gc,
+            ws_kd_fp32, ws_qd_fp32, ws_ki_fp32, ws_kr_fp32
         );
     }
 #endif
@@ -203,7 +216,7 @@ void launch_fwd(
             tma_load_initial_state,
             tma_store_final_state,
             tma_store_out,
-            out_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles
+            out_ptr, all_states_ptr, T_total, H, N, cu_seqlens_ptr, total_tiles
         );
     }
 #endif
@@ -215,7 +228,7 @@ void launch_fwd(
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, void const*, float, void*, \
-        cutlass::bfloat16_t*, void*, int, int, int, int, \
+        cutlass::bfloat16_t*, void*, cutlass::bfloat16_t*, int, int, int, int, \
         int64_t const*, float const*, float const*, float, cudaStream_t);
 
 #define INSTANTIATE_STATE_VARIANTS(VL) \

@@ -143,6 +143,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     CUTE_GRID_CONSTANT TmaStoreState const tma_store_final_state,
     CUTE_GRID_CONSTANT TmaStoreOut const tma_store_out,
     cutlass::bfloat16_t* out_raw_ptr,
+    cutlass::bfloat16_t* all_states_ptr,  // [N*H*t_tiles, D, D] or nullptr
     int T_total,
     int H,
     int N,
@@ -437,6 +438,21 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             constexpr int load_stage = 0;
             constexpr int out_stage = 0;
 #endif
+
+            // Store current state (S_in for this chunk) to global all_states buffer
+            // State in smem uses swizzled StateSmemLayout; write to gmem in row-major order.
+            if (all_states_ptr != nullptr) {
+                compute_barrier.arrive_and_wait();
+                int state_idx = head_idx * total_tiles + tile_base + t;
+                BF16* state_dst = all_states_ptr + int64_t(state_idx) * D * D;
+                Tensor s_acc_store = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), StateSmemLayout{});
+                for (int i = compute_tid; i < D * D; i += kComputeThreads) {
+                    int row = i / D;
+                    int col = i % D;
+                    state_dst[i] = s_acc_store(row, col);
+                }
+                compute_barrier.arrive_and_wait();
+            }
 
             Tensor v_tile = make_tensor(make_smem_ptr(shared_storage.input[load_stage].v.begin()), VOLayout{});
             Tensor beta_tile = make_tensor(make_smem_ptr(shared_storage.input[load_stage].beta.begin()), BetaSmemLayout{});

@@ -89,7 +89,7 @@ template <
     class TmaLoadBeta,
     class TmaLoadG,
     class TmaLoadDtBias,
-    class TmaStoreWsKD, class TmaStoreWsQD, class TmaStoreWsKR,
+    class TmaStoreWsKD, class TmaStoreWsQD, class TmaStoreWsKR, class TmaStoreWsKI,
     class TmaStoreWsGT, class TmaStoreWsINV, class TmaStoreWsMqk,
     int CHUNK,
     int D,
@@ -105,6 +105,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     CUTE_GRID_CONSTANT TmaStoreWsKD const tma_store_ws_kd,
     CUTE_GRID_CONSTANT TmaStoreWsQD const tma_store_ws_qd,
     CUTE_GRID_CONSTANT TmaStoreWsKR const tma_store_ws_kr,
+    CUTE_GRID_CONSTANT TmaStoreWsKI const tma_store_ws_ki,
     CUTE_GRID_CONSTANT TmaStoreWsGT const tma_store_ws_gt,
     CUTE_GRID_CONSTANT TmaStoreWsINV const tma_store_ws_inv,
     CUTE_GRID_CONSTANT TmaStoreWsMqk const tma_store_ws_mqk,
@@ -115,7 +116,12 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     int64_t const* cu_seqlens,
     int total_tiles,
     float const* A_log_ptr,
-    float gate_scale
+    float gate_scale,
+    float* ws_gc_ptr,  // [H*total_tiles, CHUNK, D] workspace for gc (gate cumsum, fp32, for backward)
+    float* ws_kd_fp32_ptr,  // [H*total_tiles, CHUNK, D] fp32 kd for backward precision
+    float* ws_qd_fp32_ptr,
+    float* ws_ki_fp32_ptr,
+    float* ws_kr_fp32_ptr
 ) {
     // --- constants
     using BF16 = cutlass::bfloat16_t;
@@ -171,7 +177,7 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         int tiles_per_seq = (T_seq + CHUNK - 1) / CHUNK;
         seq_idx = global_tile_idx / tiles_per_seq;
         tiles_before = seq_idx * tiles_per_seq;
-        local_t = global_tile_idx - tiles_before;
+        local_t = global_tile_idx - tiles_before; // chunk在序列内的编号
         bos = seq_idx * T_seq;
         eos = bos + T_seq;
     }
@@ -319,6 +325,18 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
     }
     __syncthreads();
 
+    // Store gc (gate cumsum in log2 space) to global workspace before exp2 conversion
+    // g_smem currently holds gc[row][col] = cumsum of g_nat along rows
+    {
+        int gc_ws_idx = head_idx * total_tiles + global_tile_idx;
+        float* gc_out = ws_gc_ptr + int64_t(gc_ws_idx) * CHUNK * D;
+        float const* g_smem = shared_storage.g.begin();
+        for (int idx = threadIdx.x; idx < CHUNK * D; idx += NumThreads) {
+            gc_out[idx] = g_smem[idx];
+        }
+    }
+    // No sync needed here since we only READ g_smem (no write conflict)
+
     Tensor q_tile = make_tensor(make_smem_ptr(shared_storage.q.begin()), QKLayout{});
     Tensor k_tile = make_tensor(make_smem_ptr(shared_storage.k.begin()), QKLayout{});
     Tensor g_tile = make_tensor(make_smem_ptr(shared_storage.g.begin()), GLayout{});
@@ -405,6 +423,13 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         // Safe: all 256 threads enter this if block (compute_tid < 256 always true)
         __syncthreads();
 
+        // Compute ws_idx once for fp32 global stores
+        int fp32_ws_idx = head_idx * total_tiles + global_tile_idx;
+        float* kd_fp32_out = ws_kd_fp32_ptr + int64_t(fp32_ws_idx) * CHUNK * D;
+        float* qd_fp32_out = ws_qd_fp32_ptr + int64_t(fp32_ws_idx) * CHUNK * D;
+        float* ki_fp32_out = ws_ki_fp32_ptr + int64_t(fp32_ws_idx) * CHUNK * D;
+        float* kr_fp32_out = ws_kr_fp32_ptr + int64_t(fp32_ws_idx) * CHUNK * D;
+
         #pragma unroll
         for (int m_blk = 0; m_blk < CHUNK; m_blk += 8) {
             #pragma unroll
@@ -428,12 +453,22 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 Tensor r_kd = make_tensor_like<BF16>(s_kd);
                 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
-                    float g = reg_g[tile_idx][v];
-                    BF16 q = reg_q[tile_idx][v];
-                    BF16 k = reg_k[tile_idx][v];
-                    BF16 exp_cumsum = BF16(ex2_approx_ftz_f32(g));
-                    r_qd(0, v) = q * exp_cumsum * BF16(scale);
-                    r_kd(0, v) = k * exp_cumsum;
+                    float gc_val = reg_g[tile_idx][v];
+                    float q_f = bf16_to_f32(reg_q[tile_idx][v]);
+                    float k_f = bf16_to_f32(reg_k[tile_idx][v]);
+                    float exp_gc = ex2_approx_ftz_f32(gc_val);
+
+                    // fp32 values for backward
+                    float qd_f32 = q_f * exp_gc * scale;
+                    float kd_f32 = k_f * exp_gc;
+                    int col = col_base + t * 2 + v;
+                    kd_fp32_out[row * D + col] = kd_f32;
+                    qd_fp32_out[row * D + col] = qd_f32;
+
+                    // bf16 values for forward K2 (same as before)
+                    BF16 exp_cumsum = BF16(exp_gc);
+                    r_qd(0, v) = reg_q[tile_idx][v] * exp_cumsum * BF16(scale);
+                    r_kd(0, v) = reg_k[tile_idx][v] * exp_cumsum;
                 }
                 cute::copy(AutoVectorizingCopy{}, r_qd, s_qd);
                 cute::copy(AutoVectorizingCopy{}, r_kd, s_kd);
@@ -442,11 +477,22 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
                 Tensor r_kr = make_tensor_like<BF16>(s_kr);
                 #pragma unroll
                 for (int v = 0; v < 2; ++v) {
-                    float g = reg_g[tile_idx][v];
-                    BF16 k = reg_k[tile_idx][v];
-                    BF16 inv_cumsum = BF16(ex2_approx_ftz_f32(-g));
-                    r_ki(0, v) = k * inv_cumsum;
-                    r_kr(0, v) = k * inv_cumsum * BF16(reg_gt[tile_idx][v]);
+                    float gc_val = reg_g[tile_idx][v];
+                    float k_f = bf16_to_f32(reg_k[tile_idx][v]);
+                    float exp_neg_gc = ex2_approx_ftz_f32(-gc_val);
+                    float gt_f = reg_gt[tile_idx][v];
+
+                    // fp32 values for backward
+                    float ki_f32 = k_f * exp_neg_gc;
+                    float kr_f32 = k_f * exp_neg_gc * gt_f;
+                    int col = col_base + t * 2 + v;
+                    ki_fp32_out[row * D + col] = ki_f32;
+                    kr_fp32_out[row * D + col] = kr_f32;
+
+                    // bf16 values for forward K2 (same as before)
+                    BF16 inv_cumsum = BF16(exp_neg_gc);
+                    r_ki(0, v) = reg_k[tile_idx][v] * inv_cumsum;
+                    r_kr(0, v) = reg_k[tile_idx][v] * inv_cumsum * BF16(gt_f);
                 }
                 cute::copy(AutoVectorizingCopy{}, r_ki, s_ki);
                 cute::copy(AutoVectorizingCopy{}, r_kr, s_kr);
@@ -529,6 +575,17 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
             Tensor s_kr = make_tensor(make_smem_ptr(shared_storage.k_restored.begin()), TMAVOLayout{});
             auto cta_tma = tma_store_ws_kr.get_slice(Int<0>{});
             cute::copy(tma_store_ws_kr, cta_tma.partition_S(s_kr), cta_tma.partition_D(g_ws_tile));
+            tma_store_arrive();
+        }
+        // Store k_inv [CHUNK, D] bf16
+        {
+            auto g_ws = tma_store_ws_ki.get_tma_tensor(make_shape(H * total_tiles, CHUNK, D));
+            auto ws_off = g_ws.layout()(ws_idx, 0, 0);
+            Tensor g_ws_tile = make_tensor(g_ws.data() + ws_off,
+                make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}), stride(g_ws.layout())));
+            Tensor s_ki = make_tensor(make_smem_ptr(shared_storage.k_inv.begin()), TMAVOLayout{});
+            auto cta_tma = tma_store_ws_ki.get_slice(Int<0>{});
+            cute::copy(tma_store_ws_ki, cta_tma.partition_S(s_ki), cta_tma.partition_D(g_ws_tile));
             tma_store_arrive();
         }
         // Store g_total [D] float
