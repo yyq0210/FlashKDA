@@ -67,7 +67,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_bwd_prepare(
     int seq_len, t_tiles_this_seq;
 
     if constexpr (IsVarlen) {
-        seq_idx = 0;
+        seq_idx = -1;
         int tiles_before = 0;
         for (int i = 0; i < N; i++) {
             int slen = int(cu_seqlens[i + 1] - cu_seqlens[i]);
@@ -78,6 +78,10 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_bwd_prepare(
             }
             tiles_before += n_tiles;
         }
+        // total_tiles is an upper bound for varlen, so phantom CTAs whose tile
+        // index lands past the last real tile must be culled: otherwise they
+        // fall through with seq_idx=0 and race the real CTAs on seq-0's outputs.
+        if (seq_idx < 0) return;
         local_t = global_tile_idx - tiles_before;
         bos = cu_seqlens[seq_idx];
         eos = cu_seqlens[seq_idx + 1];
