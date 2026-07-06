@@ -29,9 +29,12 @@ void launch_fwd(
     constexpr int kInputStages = 3;
     constexpr int kOutputStages = 2;
     constexpr int CHUNK = 16;
+    // Value-split factor for Kernel 2: grid.z = VS groups of VCOLS = D/VS value columns.
+    constexpr int VS = 2;
+    constexpr int VCOLS = D / VS;
 
     using K1L = K1Layouts<D, CHUNK>;
-    using K2L = K2Layouts<D, CHUNK>;
+    using K2L = K2Layouts<D, CHUNK, VS>;
     using WS = WorkspaceSizes<CHUNK, D>;
 
     // TMA layouts for Kernel 1
@@ -45,6 +48,8 @@ void launch_fwd(
     // TMA layouts for Kernel 2
     using TMAStateSmemLayout = typename K2L::TMAStateSmemLayout;
     using TMAFP32StateSmemLayout = typename K2L::TMAFP32StateSmemLayout;
+    // K2 v/out are value-sliced [CHUNK, VCOLS] (distinct from K1's full-width VO)
+    using TMAVOLayoutK2 = typename K2L::TMAVOLayout;
 
     // --- gmem layouts for original tensors
     auto gmem_layout = make_layout(make_shape(H, T_total, D), make_stride(D, D * H, 1));
@@ -101,7 +106,7 @@ void launch_fwd(
     auto tma_store_ws_mqk = make_tma_copy(SM90_TMA_STORE{}, m_ws_mqk, TMALMLayout{});
 
     // --- TMA descriptors for Kernel 2 (loads: v,beta,workspace; load/store: state,out)
-    auto tma_load_v     = make_tma_copy(SM90_TMA_LOAD{}, m_v, TMAVOLayout{});
+    auto tma_load_v     = make_tma_copy(SM90_TMA_LOAD{}, m_v, TMAVOLayoutK2{});
     auto tma_load_beta2 = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
 
     auto tma_load_ws_kd  = make_tma_copy(SM90_TMA_LOAD{}, m_ws_kd, TMAVOLayout{});
@@ -111,7 +116,7 @@ void launch_fwd(
     auto tma_load_ws_inv = make_tma_copy(SM90_TMA_LOAD{}, m_ws_inv, TMALMLayout{});
     auto tma_load_ws_mqk = make_tma_copy(SM90_TMA_LOAD{}, m_ws_mqk, TMALMLayout{});
 
-    auto tma_store_out = make_tma_copy(SM90_TMA_STORE{}, m_out, TMAVOLayout{});
+    auto tma_store_out = make_tma_copy(SM90_TMA_STORE{}, m_out, TMAVOLayoutK2{});
 
     // --- State TMA descriptors (conditional on HasStateIn/HasStateOut and StateFP32)
     auto make_state_tma = [&]() {
@@ -176,7 +181,9 @@ void launch_fwd(
     // ===== Launch Kernel 2 (recurrence) =====
 #if BLOCK_LEVEL_K2 >= 0
     {
-        constexpr int kK2Threads = 32 * 2 + 128;
+        // kMmaWarps = VCOLS/32; block = compute warps + 1 load + 1 store warp
+        constexpr int kMmaWarps = VCOLS / 32;
+        constexpr int kK2Threads = 32 * 2 + kMmaWarps * 32;
         using SharedStorageK2T = SharedStorageK2<K2L, kInputStages, kOutputStages>;
         int smem_size_k2 = sizeof(SharedStorageK2T);
 
@@ -187,13 +194,13 @@ void launch_fwd(
             decltype(tma_load_initial_state),
             decltype(tma_store_final_state),
             decltype(tma_store_out),
-            CHUNK, D, kInputStages, kOutputStages, kK2Threads,
+            CHUNK, D, kInputStages, kOutputStages, kK2Threads, VS,
             HasStateIn, HasStateOut, StateFP32, IsVarlen
         >;
 
         cudaFuncSetAttribute(kernel2, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_k2);
 
-        dim3 grid_k2(N, H);
+        dim3 grid_k2(N, H, VS);
         dim3 block_k2(kK2Threads);
 
         kernel2<<<grid_k2, block_k2, smem_size_k2, stream>>>(

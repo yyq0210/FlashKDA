@@ -6,8 +6,11 @@
 
 #include "utils.cuh"
 
-template <int D, int CHUNK = 16>
+// VS = value-split factor: grid.z groups of VCOLS = D/VS value columns.
+// VS=1 reproduces the original single-block-per-(seq,head) layout exactly.
+template <int D, int CHUNK = 16, int VS = 1>
 struct K2Layouts {
+    static constexpr int VCOLS = D / VS;
     using MMALayout = decltype(tile_to_shape(
         GMMA::Layout_K_INTER_Atom<cute::bfloat16_t>{},
         make_shape(Int<CHUNK>{}, Int<D>{}),
@@ -18,17 +21,27 @@ struct K2Layouts {
         make_shape(Int<D>{}, Int<CHUNK>{}),
         LayoutRight{}
     ));
-    using VOLayout = MMALayout;
-    using TransposedVOLayout = TransposedMMALayout;
+    // v / out are value-sliced: [CHUNK, VCOLS]
+    using VOLayout = decltype(tile_to_shape(
+        GMMA::Layout_K_INTER_Atom<cute::bfloat16_t>{},
+        make_shape(Int<CHUNK>{}, Int<VCOLS>{}),
+        LayoutLeft{}
+    ));
+    using TransposedVOLayout = decltype(tile_to_shape(
+        GMMA::Layout_MN_INTER_Atom<cute::bfloat16_t>{},
+        make_shape(Int<VCOLS>{}, Int<CHUNK>{}),
+        LayoutRight{}
+    ));
     using BetaSmemLayout = Layout<Shape<Int<32>>, Stride<Int<1>>>;
+    // state is stored [D_v, D_k]; each block owns VCOLS value rows -> [VCOLS, D]
     using StateSmemLayout = decltype(tile_to_shape(
         GMMA::Layout_K_INTER_Atom<cute::bfloat16_t>{},
-        make_shape(Int<D>{}, Int<D>{}),
+        make_shape(Int<VCOLS>{}, Int<D>{}),
         LayoutLeft{}
     ));
     using TransposedStateSmemLayout = decltype(tile_to_shape(
         GMMA::Layout_MN_INTER_Atom<cute::bfloat16_t>{},
-        make_shape(Int<D>{}, Int<D>{}),
+        make_shape(Int<D>{}, Int<VCOLS>{}),
         LayoutRight{}
     ));
     using GTotalLayout = Layout<Shape<Int<D>>, Stride<Int<1>>>;
@@ -43,6 +56,12 @@ struct K2Layouts {
         VOLayout{}.layout_a(),
         VOLayout{}.offset(),
         prepend(VOLayout{}.layout_b())
+    ));
+    // Full-width [CHUNK, D] TMA layout for K-side operands (kd/qd/kr, value-shared)
+    using TMAMMALayout = decltype(composition(
+        MMALayout{}.layout_a(),
+        MMALayout{}.offset(),
+        prepend(MMALayout{}.layout_b())
     ));
     using TMAStateSmemLayout = decltype(composition(
         StateSmemLayout{}.layout_a(),
@@ -59,7 +78,7 @@ struct K2Layouts {
     // FP32 state layout (K_SW32 atom, same 8x8 atom structure as K_INTER bf16)
     using FP32StateSmemLayout = decltype(tile_to_shape(
         GMMA::Layout_K_SW32_Atom<float>{},
-        make_shape(Int<D>{}, Int<D>{}),
+        make_shape(Int<VCOLS>{}, Int<D>{}),
         LayoutLeft{}
     ));
     using TMAFP32StateSmemLayout = decltype(composition(
@@ -125,6 +144,7 @@ template <
     int InputStages,
     int OutputStages,
     int NumThreads,
+    int VS = 1,
     bool HasStateIn = true,
     bool HasStateOut = true,
     bool StateFP32 = false,
@@ -151,7 +171,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 ) {
     using BF16 = cutlass::bfloat16_t;
     using FP16 = cutlass::half_t;
-    using Layouts = K2Layouts<D, CHUNK>;
+    using Layouts = K2Layouts<D, CHUNK, VS>;
     using MMALayout = typename Layouts::MMALayout;
     using TransposedMMALayout = typename Layouts::TransposedMMALayout;
     using VOLayout = typename Layouts::VOLayout;
@@ -162,12 +182,15 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     using GTotalLayout = typename Layouts::GTotalLayout;
     using LMLayout = typename Layouts::LMLayout;
     using TMAVOLayout = typename Layouts::TMAVOLayout;
+    using TMAMMALayout = typename Layouts::TMAMMALayout;
     using TMABetaSmemLayout = typename Layouts::TMABetaSmemLayout;
     using TMAStateSmemLayout = typename Layouts::TMAStateSmemLayout;
     using TMALMLayout = typename Layouts::TMALMLayout;
     using TMAGTotalSmemLayout = typename Layouts::TMAGTotalSmemLayout;
     constexpr int kWarpSize = 32;
-    constexpr int kComputeThreads = 128;
+    constexpr int VCOLS = D / VS;                 // value columns owned by this block
+    constexpr int kMmaWarps = VCOLS / 32;         // each MMA warp owns 2 x 16 = 32 value cols
+    constexpr int kComputeThreads = kMmaWarps * kWarpSize;
 
     // Transaction bytes: v + beta + k_decayed + q_decayed + k_restored + g_total + INV + Mqk
     constexpr uint32_t kTmaTransactionBytes =
@@ -215,6 +238,8 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
     // --- per-block sequence info
     int seq_idx  = blockIdx.x;
     int head_idx = blockIdx.y;
+    int vsplit   = blockIdx.z;          // value-split group in [0, VS)
+    int vbase    = vsplit * VCOLS;       // first value column owned by this block
     int64_t bos, eos;
     int tile_base;
 
@@ -248,9 +273,9 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kStateTransactionBytes);
 
             Tensor g_init = tma_load_initial_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto init_off = g_init.layout()(seq_idx * H + head_idx, 0, 0);
+            auto init_off = g_init.layout()(seq_idx * H + head_idx, vbase, 0);
             Tensor g_init_tile = make_tensor(g_init.data() + init_off,
-                make_layout(make_shape(Int<1>{}, Int<D>{}, Int<D>{}), stride(g_init.layout())));
+                make_layout(make_shape(Int<1>{}, Int<VCOLS>{}, Int<D>{}), stride(g_init.layout())));
             Tensor s_state = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TMAStateSmemLayout{});
 
             auto cta_tma_load_state = tma_load_initial_state.get_slice(Int<0>{});
@@ -276,9 +301,9 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             shared_storage.state_acc_tma_barrier.arrive_and_expect_tx(kFP32StateTransactionBytes);
 
             Tensor g_init = tma_load_initial_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto init_off = g_init.layout()(seq_idx * H + head_idx, 0, 0);
+            auto init_off = g_init.layout()(seq_idx * H + head_idx, vbase, 0);
             Tensor g_init_tile = make_tensor(g_init.data() + init_off,
-                make_layout(make_shape(Int<1>{}, Int<D>{}, Int<D>{}), stride(g_init.layout())));
+                make_layout(make_shape(Int<1>{}, Int<VCOLS>{}, Int<D>{}), stride(g_init.layout())));
             Tensor s_fp32 = make_tensor(
                 make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_fp32_buf)),
                 TMAFP32StateSmemLayout{});
@@ -295,7 +320,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
         cutlass::arch::fence_view_async_shared();
 
         // All threads: convert fp32 -> bf16 with layout transformation
-        smem_cvt_fp32_to_bf16<FP32StateSmemLayout, StateSmemLayout, D, NumThreads>(
+        smem_cvt_fp32_to_bf16<FP32StateSmemLayout, StateSmemLayout, VCOLS, D, NumThreads>(
             reinterpret_cast<float*>(shared_storage.state_fp32_buf),
             shared_storage.state_acc.begin(),
             threadIdx.x);
@@ -347,9 +372,9 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
             int ws_idx = head_idx * total_tiles + tile_base + t;
 
             // TMA load v
-            auto v_off = g_v.layout()(head_idx, int(bos) + t * CHUNK, 0);
+            auto v_off = g_v.layout()(head_idx, int(bos) + t * CHUNK, vbase);
             Tensor g_v_tile = make_tensor(g_v.data() + v_off,
-                make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}), stride(g_v.layout())));
+                make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<VCOLS>{}), stride(g_v.layout())));
             Tensor s_v_tile = make_tensor(make_smem_ptr(shared_storage.input[stage].v.begin()), TMAVOLayout{});
             cute::copy(tma_load_v.with(*tma_barrier),
                 cta_tma_load_v.partition_S(g_v_tile), cta_tma_load_v.partition_D(s_v_tile));
@@ -368,7 +393,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 auto off = g_ws_kd.layout()(ws_idx, 0, 0);
                 Tensor g_tile = make_tensor(g_ws_kd.data() + off,
                     make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}), stride(g_ws_kd.layout())));
-                Tensor s_tile = make_tensor(make_smem_ptr(shared_storage.input[stage].k_decayed.begin()), TMAVOLayout{});
+                Tensor s_tile = make_tensor(make_smem_ptr(shared_storage.input[stage].k_decayed.begin()), TMAMMALayout{});
                 cute::copy(tma_load_ws_kd.with(*tma_barrier), cta_ws_kd.partition_S(g_tile), cta_ws_kd.partition_D(s_tile));
             }
             // q_decayed
@@ -376,7 +401,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 auto off = g_ws_qd.layout()(ws_idx, 0, 0);
                 Tensor g_tile = make_tensor(g_ws_qd.data() + off,
                     make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}), stride(g_ws_qd.layout())));
-                Tensor s_tile = make_tensor(make_smem_ptr(shared_storage.input[stage].q_decayed.begin()), TMAVOLayout{});
+                Tensor s_tile = make_tensor(make_smem_ptr(shared_storage.input[stage].q_decayed.begin()), TMAMMALayout{});
                 cute::copy(tma_load_ws_qd.with(*tma_barrier), cta_ws_qd.partition_S(g_tile), cta_ws_qd.partition_D(s_tile));
             }
             // k_restored
@@ -384,7 +409,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
                 auto off = g_ws_kr.layout()(ws_idx, 0, 0);
                 Tensor g_tile = make_tensor(g_ws_kr.data() + off,
                     make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}), stride(g_ws_kr.layout())));
-                Tensor s_tile = make_tensor(make_smem_ptr(shared_storage.input[stage].k_restored.begin()), TMAVOLayout{});
+                Tensor s_tile = make_tensor(make_smem_ptr(shared_storage.input[stage].k_restored.begin()), TMAMMALayout{});
                 cute::copy(tma_load_ws_kr.with(*tma_barrier), cta_ws_kr.partition_S(g_tile), cta_ws_kr.partition_D(s_tile));
             }
             // g_total
@@ -752,19 +777,19 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 
             if (actual_len < CHUNK) {
                 // Manual store for tail tile to avoid overwriting next sequence
-                // Only one thread (lane_predicate) runs here, so loop over all D
+                // Only one thread (lane_predicate) runs here, so loop over all VCOLS
                 Tensor s_out = make_tensor(make_smem_ptr(out_stage_ptr), VOLayout{});
                 for (int row = 0; row < actual_len; ++row) {
-                    int64_t global_base = (bos + t * CHUNK + row) * H * D + head_idx * D;
-                    for (int col = 0; col < D; ++col) {
+                    int64_t global_base = (bos + t * CHUNK + row) * H * D + head_idx * D + vbase;
+                    for (int col = 0; col < VCOLS; ++col) {
                         out_raw_ptr[global_base + col] = s_out(row, col);
                     }
                 }
             } else {
                 // TMA store for full tiles
-                auto out_off = g_out.layout()(head_idx, int(bos) + t * CHUNK, 0);
+                auto out_off = g_out.layout()(head_idx, int(bos) + t * CHUNK, vbase);
                 Tensor g_out_tile = make_tensor(g_out.data() + out_off,
-                    make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{}), stride(g_out.layout())));
+                    make_layout(make_shape(Int<1>{}, Int<CHUNK>{}, Int<VCOLS>{}), stride(g_out.layout())));
                 Tensor s_out_tile = make_tensor(make_smem_ptr(out_stage_ptr), TMAVOLayout{});
                 cute::copy(
                     tma_store_out,
@@ -782,9 +807,9 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
         if constexpr (HasStateOut && !StateFP32) {
             // BF16 state: TMA store directly from state_acc
             Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto state_off = g_final.layout()(seq_idx * H + head_idx, 0, 0);
+            auto state_off = g_final.layout()(seq_idx * H + head_idx, vbase, 0);
             Tensor g_final_tile = make_tensor(g_final.data() + state_off,
-                make_layout(make_shape(Int<1>{}, Int<D>{}, Int<D>{}), stride(g_final.layout())));
+                make_layout(make_shape(Int<1>{}, Int<VCOLS>{}, Int<D>{}), stride(g_final.layout())));
             Tensor s_state = make_tensor(make_smem_ptr(shared_storage.state_acc.begin()), TMAStateSmemLayout{});
 
             auto cta_tma_store_state = tma_store_final_state.get_slice(Int<0>{});
@@ -804,7 +829,7 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 
         __syncthreads();  // all warps sync — pipeline smem now free
 
-        smem_cvt_bf16_to_fp32<StateSmemLayout, FP32StateSmemLayout, D, NumThreads>(
+        smem_cvt_bf16_to_fp32<StateSmemLayout, FP32StateSmemLayout, VCOLS, D, NumThreads>(
             shared_storage.state_acc.begin(),
             reinterpret_cast<float*>(shared_storage.state_fp32_buf),
             threadIdx.x);
@@ -812,9 +837,9 @@ __global__ void __launch_bounds__(NumThreads) _flash_kda_fwd_recurrence(
 
         if (warp_role == WarpRole::STORE && lane_predicate) {
             Tensor g_final = tma_store_final_state.get_tma_tensor(make_shape(N * H, D, D));
-            auto state_off = g_final.layout()(seq_idx * H + head_idx, 0, 0);
+            auto state_off = g_final.layout()(seq_idx * H + head_idx, vbase, 0);
             Tensor g_final_tile = make_tensor(g_final.data() + state_off,
-                make_layout(make_shape(Int<1>{}, Int<D>{}, Int<D>{}), stride(g_final.layout())));
+                make_layout(make_shape(Int<1>{}, Int<VCOLS>{}, Int<D>{}), stride(g_final.layout())));
             Tensor s_fp32 = make_tensor(
                 make_smem_ptr(reinterpret_cast<float*>(shared_storage.state_fp32_buf)),
                 TMAFP32StateSmemLayout{});
